@@ -1,0 +1,3 @@
+"""A lightweight desktop network monitor."""
+
+__version__ = "0.1.0"
