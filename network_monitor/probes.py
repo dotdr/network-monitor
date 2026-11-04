@@ -44,6 +44,11 @@ def _icmp_probe(address: str, timeout_seconds: float) -> tuple[bool, float | Non
             stderr=subprocess.DEVNULL,
             timeout=timeout_seconds + 1,
             check=False,
+            creationflags=(
+                subprocess.CREATE_NO_WINDOW
+                if platform.system().lower() == "windows"
+                else 0
+            ),
         )
     except subprocess.TimeoutExpired:
         return False, None, "ICMP probe timed out"

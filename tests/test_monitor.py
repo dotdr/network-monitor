@@ -1,3 +1,4 @@
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -12,7 +13,7 @@ from network_monitor.preferences import (
     load_preferences,
     save_preferences,
 )
-from network_monitor.probes import probe_host
+from network_monitor.probes import _icmp_probe, probe_host
 from network_monitor.reporting import export_pdf
 from network_monitor.scanner import parse_scan_network, reverse_lookup, scan_network
 from network_monitor.storage import MonitorDatabase
@@ -96,6 +97,28 @@ class PreferencesTests(unittest.TestCase):
 
 
 class ProbeTests(unittest.TestCase):
+    def test_windows_icmp_probe_does_not_open_a_console_window(self) -> None:
+        with (
+            patch("network_monitor.probes.platform.system", return_value="Windows"),
+            patch(
+                "network_monitor.probes._icmp_command",
+                return_value=["ping", "-n", "1", "192.168.1.1"],
+            ),
+            patch(
+                "network_monitor.probes.subprocess.CREATE_NO_WINDOW",
+                0x08000000,
+                create=True,
+            ),
+            patch(
+                "network_monitor.probes.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 0),
+            ) as run,
+        ):
+            success, _latency, _detail = _icmp_probe("192.168.1.1", 0.1)
+
+        self.assertTrue(success)
+        self.assertEqual(run.call_args.kwargs["creationflags"], 0x08000000)
+
     def test_automatic_mode_falls_back_to_tcp(self) -> None:
         host = Host(1, "example.com", 443)
         with (
