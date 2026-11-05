@@ -24,9 +24,12 @@ def load_preferences(path: str | Path) -> Preferences:
         values = json.loads(preferences_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"Could not read preferences at {preferences_path}: {error}") from error
+    return preferences_from_dict(values)
+
+
+def preferences_from_dict(values: object) -> Preferences:
     if not isinstance(values, dict):
         raise ValueError("Preferences must be a JSON object.")
-
     defaults = asdict(Preferences())
     unknown_keys = set(values) - set(defaults)
     if unknown_keys:

@@ -4,13 +4,19 @@ import queue
 import re
 import threading
 import tkinter as tk
+import time
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from tkinter import filedialog, messagebox, ttk
 
 from .alerts import HostAlertTracker
 from .models import Host, HostSummary, ProbeResult, Sample
 from .notifications import notify
-from .preferences import Preferences, load_preferences, save_preferences
+from .preferences import (
+    Preferences,
+    load_preferences,
+    preferences_from_dict,
+)
 from .probes import probe_host
 from .reporting import export_pdf
 from .scanner import (
@@ -75,7 +81,16 @@ class MonitorApp:
         self.root = root
         self.database = database or MonitorDatabase()
         self.preferences_path = self.database.path.parent / "settings.json"
-        self.preferences = load_preferences(self.preferences_path)
+        settings = self.database.load_settings()
+        if settings is None:
+            self.preferences = (
+                load_preferences(self.preferences_path)
+                if self.preferences_path.exists()
+                else Preferences()
+            )
+            self.database.save_settings(asdict(self.preferences))
+        else:
+            self.preferences = preferences_from_dict(settings)
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
         self.stop_event: threading.Event | None = None
         self.worker: threading.Thread | None = None
@@ -84,6 +99,7 @@ class MonitorApp:
         self.hostnames: dict[int, str] = {}
         self.hostname_lookups: set[int] = set()
         self.chart_samples_by_host: dict[int, list[Sample]] = {}
+        self.last_chart_refresh = 0.0
         self.graph_host_ids: set[int] | None = (
             set(self.preferences.graph_host_ids)
             if self.preferences.graph_host_ids is not None
@@ -454,7 +470,10 @@ class MonitorApp:
         since = datetime.now(timezone.utc) - timedelta(
             hours=self.graph_window_hours
         )
-        self.chart_samples_by_host = self.database.chart_samples(since=since)
+        self.chart_samples_by_host = self.database.chart_samples(
+            since=since, host_ids=self.graph_host_ids
+        )
+        self.last_chart_refresh = time.monotonic()
         self._draw_chart()
 
     def _lookup_entered_address(self) -> None:
@@ -926,7 +945,7 @@ class MonitorApp:
         self, hosts: tuple[Host, ...], stop_event: threading.Event
     ) -> None:
         while not stop_event.is_set():
-            cycle_started = datetime.now(timezone.utc)
+            cycle_started = time.monotonic()
             for host in hosts:
                 if stop_event.is_set():
                     break
@@ -943,102 +962,109 @@ class MonitorApp:
                         datetime.now(timezone.utc),
                     )
                     self.messages.put(("sample", (host, result)))
-            elapsed = (datetime.now(timezone.utc) - cycle_started).total_seconds()
+            elapsed = time.monotonic() - cycle_started
             stop_event.wait(max(0.1, self.poll_interval_seconds - elapsed))
         self.messages.put(("stopped", None))
 
     def _drain_messages(self) -> None:
-        try:
-            while True:
+        pending_samples: list[tuple[Host, ProbeResult]] = []
+        processed = 0
+        max_messages = 500
+        while processed < max_messages:
+            try:
                 kind, payload = self.messages.get_nowait()
-                if kind == "sample":
-                    host, result = payload
-                    try:
-                        self.database.record_sample(host, result)
-                    except Exception:
-                        LOGGER.exception("Could not save monitor sample")
-                        self.status_label.configure(
-                            text="●  Storage error", foreground="#b44343"
-                        )
-                    else:
-                        self._handle_alert(host, result)
-                        self._refresh_host_statistics()
-                        self._refresh_history()
-                elif kind == "stopped":
-                    self.start_button.configure(state="normal")
-                    self.stop_button.configure(state="disabled")
-                    self.add_button.configure(state="normal")
-                    self.remove_button.configure(state="normal")
-                    self.address_entry.configure(state="normal")
-                    self.port_entry.configure(state="normal")
-                    self.scan_main_button.configure(state="normal")
-                    self.status_label.configure(
-                        text="●  Stopped", foreground="#64788b"
-                    )
-                elif kind == "scan_complete":
-                    results = payload
-                    if self.scan_button is not None:
-                        self.scan_button.configure(state="normal")
-                    if self.scan_tree is not None:
-                        self.scan_results = {
-                            result.address: result for result in results
-                        }
-                        for result in results:
-                            self.scan_tree.insert(
+            except queue.Empty:
+                break
+            processed += 1
+            if kind == "sample":
+                pending_samples.append(payload)
+            elif kind == "stopped":
+                self.start_button.configure(state="normal")
+                self.stop_button.configure(state="disabled")
+                self.add_button.configure(state="normal")
+                self.remove_button.configure(state="normal")
+                self.address_entry.configure(state="normal")
+                self.port_entry.configure(state="normal")
+                self.scan_main_button.configure(state="normal")
+                self.status_label.configure(
+                    text="●  Stopped", foreground="#64788b"
+                )
+            elif kind == "scan_complete":
+                results = payload
+                if self.scan_button is not None:
+                    self.scan_button.configure(state="normal")
+                if self.scan_tree is not None:
+                    self.scan_results = {
+                        result.address: result for result in results
+                    }
+                    for result in results:
+                        self.scan_tree.insert(
+                            "",
+                            "end",
+                            values=(
+                                result.address,
+                                f"{result.latency_ms:.2f} ms",
                                 "",
-                                "end",
-                                values=(
-                                    result.address,
-                                    f"{result.latency_ms:.2f} ms",
-                                    "",
-                                ),
-                            )
-                    if self.scan_status is not None:
-                        self.scan_status.configure(
-                            text=f"Found {len(results)} ICMP-responsive host(s)."
+                            ),
                         )
-                elif kind == "scan_error":
-                    if self.scan_button is not None:
-                        self.scan_button.configure(state="normal")
-                    if self.scan_status is not None:
-                        self.scan_status.configure(text="Scan failed.")
-                    messagebox.showerror("Network scan failed", str(payload))
-                elif kind == "reverse_lookup":
-                    address, source, hostname = payload
-                    if source == "entered":
-                        self.lookup_result.configure(
-                            text=f"{address} → {hostname}"
-                        )
-                    elif self.scan_tree is not None and self.scan_status is not None:
-                        selection = self.scan_tree.selection()
-                        if selection and self.scan_tree.item(selection[0], "values")[0] == address:
-                            self.scan_tree.set(selection[0], "hostname", hostname)
-                        self.scan_status.configure(text=f"{address} → {hostname}")
-                elif kind == "reverse_lookup_error":
-                    address, source, detail = payload
-                    if source == "entered":
-                        self.lookup_result.configure(
-                            text=f"No hostname found for {address}."
-                        )
-                    elif self.scan_status is not None:
-                        self.scan_status.configure(
-                            text=f"No PTR record for {address} ({detail})."
-                        )
-                elif kind == "host_hostname":
-                    host_id, hostname = payload
-                    if any(host.id == host_id for host in self.hosts):
-                        self.hostnames[host_id] = hostname
-                        item_id = str(host_id)
-                        if self.host_list.exists(item_id):
-                            values = list(self.host_list.item(item_id, "values"))
-                            values[0] = hostname
-                            self.host_list.item(item_id, values=values)
-                            self._draw_chart()
-        except queue.Empty:
-            pass
-        self.root.after(150, self._drain_messages)
+                if self.scan_status is not None:
+                    self.scan_status.configure(
+                        text=f"Found {len(results)} ICMP-responsive host(s)."
+                    )
+            elif kind == "scan_error":
+                if self.scan_button is not None:
+                    self.scan_button.configure(state="normal")
+                if self.scan_status is not None:
+                    self.scan_status.configure(text="Scan failed.")
+                messagebox.showerror("Network scan failed", str(payload))
+            elif kind == "reverse_lookup":
+                address, source, hostname = payload
+                if source == "entered":
+                    self.lookup_result.configure(text=f"{address} → {hostname}")
+                elif self.scan_tree is not None and self.scan_status is not None:
+                    selection = self.scan_tree.selection()
+                    if selection and self.scan_tree.item(selection[0], "values")[0] == address:
+                        self.scan_tree.set(selection[0], "hostname", hostname)
+                    self.scan_status.configure(text=f"{address} → {hostname}")
+            elif kind == "reverse_lookup_error":
+                address, source, detail = payload
+                if source == "entered":
+                    self.lookup_result.configure(
+                        text=f"No hostname found for {address}."
+                    )
+                elif self.scan_status is not None:
+                    self.scan_status.configure(
+                        text=f"No PTR record for {address} ({detail})."
+                    )
+            elif kind == "host_hostname":
+                host_id, hostname = payload
+                if any(host.id == host_id for host in self.hosts):
+                    self.hostnames[host_id] = hostname
+                    item_id = str(host_id)
+                    if self.host_list.exists(item_id):
+                        values = list(self.host_list.item(item_id, "values"))
+                        values[0] = hostname
+                        self.host_list.item(item_id, values=values)
+                        self._draw_chart()
 
-    def _refresh_history(self) -> None:
+        if pending_samples:
+            try:
+                self.database.record_samples(pending_samples)
+            except Exception:
+                LOGGER.exception("Could not save monitor samples")
+                self.status_label.configure(
+                    text="●  Storage error", foreground="#b44343"
+                )
+            else:
+                for host, result in pending_samples:
+                    self._handle_alert(host, result)
+                self._refresh_host_statistics()
+                self._refresh_history(refresh_chart=False)
+                if time.monotonic() - self.last_chart_refresh >= 15:
+                    self._refresh_chart_samples()
+        self.root.after(25 if processed == max_messages else 150, self._drain_messages)
+
+    def _refresh_history(self, refresh_chart: bool = True) -> None:
         for item in self.history.get_children():
             self.history.delete(item)
         samples = self.database.recent_samples(
@@ -1060,7 +1086,8 @@ class MonitorApp:
                 tags=("success" if sample.success else "failed",),
             )
         self._update_metrics(samples)
-        self._refresh_chart_samples()
+        if refresh_chart:
+            self._refresh_chart_samples()
 
     def _handle_alert(self, host: Host, result: ProbeResult) -> None:
         transition = self.alert_tracker.record(host.id, result.success)
@@ -1476,7 +1503,7 @@ class MonitorApp:
             alerts_enabled=self.alerts_enabled_var.get(),
             alert_failure_threshold=alert_failure_threshold,
         )
-        save_preferences(self.preferences_path, preferences)
+        self.database.save_settings(asdict(preferences))
         self.preferences = preferences
 
     def _close(self) -> None:

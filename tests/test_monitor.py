@@ -1,4 +1,6 @@
-import subprocess
+import ctypes
+import sqlite3
+import socket
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -13,7 +15,12 @@ from network_monitor.preferences import (
     load_preferences,
     save_preferences,
 )
-from network_monitor.probes import _icmp_probe, probe_host
+from network_monitor.probes import (
+    _IcmpEchoReply,
+    _icmp_probe,
+    _tcp_probe,
+    probe_host,
+)
 from network_monitor.reporting import export_pdf
 from network_monitor.scanner import parse_scan_network, reverse_lookup, scan_network
 from network_monitor.storage import MonitorDatabase
@@ -97,27 +104,74 @@ class PreferencesTests(unittest.TestCase):
 
 
 class ProbeTests(unittest.TestCase):
-    def test_windows_icmp_probe_does_not_open_a_console_window(self) -> None:
+    def test_windows_icmp_probe_uses_python_api_and_measures_network_call(self) -> None:
+        class FakeFunction:
+            def __init__(self, function):
+                self.function = function
+
+            def __call__(self, *args):
+                return self.function(*args)
+
+        def send_echo(*args):
+            reply = ctypes.cast(
+                args[5], ctypes.POINTER(_IcmpEchoReply)
+            ).contents
+            reply.status = 0
+            return 1
+
+        class FakeIcmpApi:
+            IcmpCreateFile = FakeFunction(lambda: 123)
+            IcmpSendEcho = FakeFunction(send_echo)
+            IcmpCloseHandle = FakeFunction(lambda _handle: 1)
+
         with (
             patch("network_monitor.probes.platform.system", return_value="Windows"),
+            patch("network_monitor.probes.ctypes.WinDLL", return_value=FakeIcmpApi(), create=True),
             patch(
-                "network_monitor.probes._icmp_command",
-                return_value=["ping", "-n", "1", "192.168.1.1"],
+                "network_monitor.probes.socket.getaddrinfo",
+                return_value=[(socket.AF_INET, socket.SOCK_DGRAM, 0, "", ("127.0.0.1", 0))],
             ),
-            patch(
-                "network_monitor.probes.subprocess.CREATE_NO_WINDOW",
-                0x08000000,
-                create=True,
-            ),
-            patch(
-                "network_monitor.probes.subprocess.run",
-                return_value=subprocess.CompletedProcess([], 0),
-            ) as run,
+            patch("network_monitor.probes.time.perf_counter", side_effect=[10.0, 10.0005]),
         ):
-            success, _latency, _detail = _icmp_probe("192.168.1.1", 0.1)
+            success, latency_ms, detail = _icmp_probe("127.0.0.1", 0.1)
 
         self.assertTrue(success)
-        self.assertEqual(run.call_args.kwargs["creationflags"], 0x08000000)
+        self.assertLess(latency_ms, 1)
+        self.assertEqual(detail, "ICMP reply received")
+
+    def test_tcp_latency_excludes_address_resolution_time(self) -> None:
+        class FakeSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, _destination):
+                pass
+
+        with (
+            patch(
+                "network_monitor.probes.socket.getaddrinfo",
+                return_value=[
+                    (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 443))
+                ],
+            ),
+            patch("network_monitor.probes.socket.socket", return_value=FakeSocket()),
+            patch(
+                "network_monitor.probes.time.perf_counter",
+                side_effect=[2.0, 2.0005],
+            ),
+        ):
+            success, latency_ms, _detail = _tcp_probe(
+                Host(1, "localhost", 443), 0.5
+            )
+
+        self.assertTrue(success)
+        self.assertLess(latency_ms, 1)
 
     def test_automatic_mode_falls_back_to_tcp(self) -> None:
         host = Host(1, "example.com", 443)
@@ -167,6 +221,89 @@ class ScannerTests(unittest.TestCase):
 
 
 class StorageTests(unittest.TestCase):
+    def test_settings_and_hosts_are_stored_separately_from_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            history_path = Path(temporary_directory) / "history.sqlite3"
+            database = MonitorDatabase(history_path)
+            host = database.add_host("192.168.1.1", 443)
+            database.save_settings({"poll_interval_seconds": 9})
+            database.record_sample(
+                host,
+                ProbeResult(
+                    True, 1.0, "ICMP", "reply", datetime.now(timezone.utc)
+                ),
+            )
+
+            self.assertEqual(database.settings_path.name, "settings.sqlite3")
+            history_tables = {
+                row["name"]
+                for row in database.connection.execute(
+                    "SELECT name FROM main.sqlite_master WHERE type = 'table'"
+                )
+            }
+            settings_tables = {
+                row["name"]
+                for row in database.connection.execute(
+                    "SELECT name FROM config.sqlite_master WHERE type = 'table'"
+                )
+            }
+            self.assertNotIn("hosts", history_tables)
+            self.assertIn("hosts", settings_tables)
+            database.close()
+
+            database = MonitorDatabase(history_path)
+            self.assertEqual(database.load_settings(), {"poll_interval_seconds": 9})
+            self.assertEqual(database.list_hosts()[0].address, "192.168.1.1")
+            self.assertEqual(database.recent_samples()[0].address, "192.168.1.1")
+            database.close()
+
+    def test_migrates_existing_hosts_and_samples_to_separate_databases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            history_path = Path(temporary_directory) / "history.sqlite3"
+            legacy = sqlite3.connect(history_path)
+            legacy.executescript(
+                """
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE hosts (
+                    id INTEGER PRIMARY KEY,
+                    address TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(address, port)
+                );
+                CREATE TABLE samples (
+                    id INTEGER PRIMARY KEY,
+                    host_id INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+                    checked_at TEXT NOT NULL,
+                    success INTEGER NOT NULL,
+                    latency_ms REAL,
+                    method TEXT NOT NULL,
+                    detail TEXT NOT NULL
+                );
+                INSERT INTO hosts(id, address, port) VALUES (9, 'localhost', 443);
+                INSERT INTO samples(
+                    id, host_id, checked_at, success, latency_ms, method, detail
+                ) VALUES (
+                    14, 9, '2026-01-01T00:00:00+00:00', 1, 0.5, 'ICMP', 'reply'
+                );
+                """
+            )
+            legacy.close()
+
+            database = MonitorDatabase(history_path)
+
+            hosts = database.list_hosts()
+            samples = database.recent_samples()
+            self.assertEqual([(host.address, host.port) for host in hosts], [("localhost", 443)])
+            self.assertEqual(samples[0].host_id, hosts[0].id)
+            self.assertEqual(samples[0].address, "localhost")
+            self.assertEqual(samples[0].latency_ms, 0.5)
+            self.assertEqual(samples[0].id, 14)
+            self.assertFalse(database.connection.execute(
+                "PRAGMA main.foreign_key_list(samples)"
+            ).fetchall())
+            database.close()
+
     def test_add_hosts_adds_multiple_and_skips_duplicates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             database = MonitorDatabase(Path(temporary_directory) / "history.sqlite3")
@@ -202,6 +339,24 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(summary.loss_percent, 50.0)
             self.assertEqual(summary.average_ms, 10.0)
             self.assertEqual(database.packet_loss(host.id), 50.0)
+            database.close()
+
+    def test_records_multiple_samples_in_a_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = MonitorDatabase(Path(temporary_directory) / "history.sqlite3")
+            host = database.add_host("example.com", 443)
+            now = datetime.now(timezone.utc)
+            database.record_samples(
+                [
+                    (host, ProbeResult(True, 1.0, "ICMP", "reply", now)),
+                    (host, ProbeResult(False, None, "ICMP", "timeout", now)),
+                ]
+            )
+
+            samples = database.recent_samples(host_id=host.id)
+
+            self.assertEqual(len(samples), 2)
+            self.assertEqual(database.summaries()[0].samples, 2)
             database.close()
 
     def test_summaries_respect_selected_time_window(self) -> None:
@@ -249,6 +404,22 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(set(samples), {first.id, second.id})
             self.assertEqual(samples[first.id][0].latency_ms, 10.0)
             self.assertEqual(samples[second.id][0].latency_ms, 20.0)
+            database.close()
+
+    def test_chart_samples_only_load_selected_hosts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = MonitorDatabase(Path(temporary_directory) / "history.sqlite3")
+            first = database.add_host("192.168.1.1", 443)
+            second = database.add_host("192.168.1.2", 443)
+            now = datetime.now(timezone.utc)
+            for host in (first, second):
+                database.record_sample(
+                    host, ProbeResult(True, 1.0, "ICMP", "reply", now)
+                )
+
+            samples = database.chart_samples(host_ids={second.id})
+
+            self.assertEqual(set(samples), {second.id})
             database.close()
 
     def test_chart_samples_respect_selected_period(self) -> None:
