@@ -38,6 +38,10 @@ class AddressValidationTests(unittest.TestCase):
             with self.subTest(address=address):
                 self.assertFalse(validate_address(address))
 
+    def test_run_duration_formats_hh_mm_ss(self) -> None:
+        self.assertEqual(MonitorApp._format_duration(3661), "01:01:01")
+        self.assertEqual(MonitorApp._format_duration(-5), "00:00:00")
+
     def test_host_latency_formats_minimum_average_and_maximum(self) -> None:
         summary = HostSummary(
             "router.local",

@@ -118,11 +118,15 @@ class MonitorApp:
         self.scan_tree: ttk.Treeview | None = None
         self.scan_button: ttk.Button | None = None
         self.scan_status: ttk.Label | None = None
+        self.run_started_at: datetime | None = None
+        self.run_started_monotonic: float | None = None
+        self.run_duration_seconds: float | None = None
         self._configure_window()
         self._build_ui()
         self._refresh_hosts()
         self._refresh_history()
         self.root.after(150, self._drain_messages)
+        self.root.after(1000, self._refresh_run_metadata)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
     def _configure_window(self) -> None:
@@ -170,6 +174,13 @@ class MonitorApp:
             header, text="●  Stopped", foreground="#64788b", font=("Segoe UI", 10)
         )
         self.status_label.pack(side="right", padx=(0, 12))
+        self.run_metadata_label = ttk.Label(
+            header,
+            text="",
+            foreground="#64788b",
+            font=("Segoe UI", 9),
+        )
+        self.run_metadata_label.pack(side="right", padx=(0, 12))
         ttk.Button(header, text="Reports", command=self._show_report).pack(side="right")
         self.scan_main_button = ttk.Button(
             header, text="Scan LAN", command=self._open_scanner
@@ -918,6 +929,12 @@ class MonitorApp:
             )
             return
         self.poll_interval_seconds = interval
+        self.run_started_at = datetime.now().astimezone()
+        self.run_started_monotonic = time.monotonic()
+        self.run_duration_seconds = None
+        self.run_metadata_label.configure(
+            text=f"Started {self.run_started_at.strftime('%Y-%m-%d %H:%M:%S')} · Running 00:00:00"
+        )
         self.stop_event = threading.Event()
         self.worker = threading.Thread(
             target=self._monitor_loop,
@@ -940,6 +957,29 @@ class MonitorApp:
             self.stop_event.set()
         self.status_label.configure(text="●  Stopping…", foreground="#a76b14")
         self.stop_button.configure(state="disabled")
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        total_seconds = max(0, int(seconds))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _refresh_run_metadata(self) -> None:
+        if (
+            self.run_started_at is not None
+            and self.run_started_monotonic is not None
+            and self.worker is not None
+            and self.worker.is_alive()
+        ):
+            elapsed = max(0.0, time.monotonic() - self.run_started_monotonic)
+            self.run_metadata_label.configure(
+                text=(
+                    f"Started {self.run_started_at.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"· Running {self._format_duration(elapsed)}"
+                )
+            )
+        self.root.after(1000, self._refresh_run_metadata)
 
     def _monitor_loop(
         self, hosts: tuple[Host, ...], stop_event: threading.Event
@@ -979,6 +1019,18 @@ class MonitorApp:
             if kind == "sample":
                 pending_samples.append(payload)
             elif kind == "stopped":
+                if self.run_started_monotonic is not None:
+                    self.run_duration_seconds = max(
+                        0.0, time.monotonic() - self.run_started_monotonic
+                    )
+                if self.run_started_at is not None:
+                    duration = self._format_duration(self.run_duration_seconds or 0.0)
+                    self.run_metadata_label.configure(
+                        text=(
+                            f"Started {self.run_started_at.strftime('%Y-%m-%d %H:%M:%S')} "
+                            f"· Duration {duration}"
+                        )
+                    )
                 self.start_button.configure(state="normal")
                 self.stop_button.configure(state="disabled")
                 self.add_button.configure(state="normal")
